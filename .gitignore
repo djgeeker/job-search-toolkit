@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+raw/
+data/
+sources/
+profiles/*.json
+!profiles/*.template.json

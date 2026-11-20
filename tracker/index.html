@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>秋招投递工作台</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header>
+  <div class="title-row">
+    <h1>秋招投递工作台 <small id="metaLine">加载中…</small></h1>
+    <div class="top-actions">
+      <button class="btn-primary" id="btnPlan">生成今日待投</button>
+      <button class="btn-soft" id="btnExportXlsx">导出 Excel</button>
+      <button class="btn-soft" id="btnExportJson">备份 JSON</button>
+      <button class="btn-soft" onclick="document.getElementById('importFile').click()">恢复备份</button>
+      <input id="importFile" type="file" accept=".json,application/json" hidden>
+      <button class="btn-soft danger" id="btnClear">清空投递记录</button>
+      <button id="themeBtn" title="切换主题">🌙</button>
+    </div>
+  </div>
+
+  <div class="pipeline" id="pipeline"></div>
+
+  <div class="controls">
+    <input id="search" type="search" placeholder="搜公司、岗位、行业…">
+    <label class="sort-wrap">排序
+      <select id="sortSelect">
+        <option value="priority">默认优先级</option>
+        <option value="deadline">截止最近</option>
+        <option value="posted">最新发布</option>
+        <option value="company">公司名</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="filter-block">
+    <span class="filter-label">方向</span><div class="chips" id="fDirection"></div>
+  </div>
+  <div class="filter-block">
+    <span class="filter-label">城市</span><div class="chips" id="fCity"></div>
+  </div>
+  <div class="filter-block">
+    <span class="filter-label">性质</span><div class="chips" id="fNature"></div>
+  </div>
+  <div class="filter-block">
+    <span class="filter-label">批次</span><div class="chips" id="fBatch"></div>
+    <span class="filter-label">届别</span><div class="chips" id="fCohort"></div>
+  </div>
+  <div class="filter-block">
+    <span class="filter-label">状态</span><div class="chips" id="fStatus"></div>
+  </div>
+  <div class="filter-block">
+    <div class="chips" id="fToggles"></div>
+    <button class="chip reset" id="btnReset">重置筛选</button>
+  </div>
+
+  <div id="stats"></div>
+</header>
+
+<main>
+  <div class="planbox" id="planbox" hidden></div>
+  <div id="resultCount"></div>
+  <div id="list"></div>
+  <button class="show-more" id="showMore" hidden>再显示 60 条</button>
+</main>
+
+<script src="xlsx.full.min.js"></script>
+<script src="data.js?v=7835253"></script>
+<script src="app.js?v=10"></script>
+</body>
+</html>

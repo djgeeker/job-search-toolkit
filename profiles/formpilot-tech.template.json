@@ -1,0 +1,92 @@
+{
+  "_说明": [
+    "FormPilot 技术版资料模板（AI Agent / 大模型应用开发方向）。",
+    "把下面所有 <> 占位符换成你的真实信息，删掉这个 _说明 字段，另存为 formpilot-tech.json，",
+    "然后在 FormPilot 的 Dashboard 里用「导入 JSON」选这个文件。",
+    "不用填的字段留空字符串就行，导入时缺的字段会自动补空，不会报错。",
+    "留学生看 custom 段落最后几条。"
+  ],
+  "meta": { "name": "技术版" },
+  "basic": {
+    "name": "<中文姓名>",
+    "nameEn": "<英文姓名 拼音即可>",
+    "phone": "<手机号>",
+    "email": "<常用邮箱>",
+    "gender": "<男 / 女>",
+    "birthday": "<YYYY-MM-DD>",
+    "age": 0,
+    "nationality": "中国",
+    "ethnicity": "<民族，如 汉族>",
+    "politicalStatus": "<政治面貌，如 共青团员 / 群众 / 中共党员>",
+    "location": "<现居城市，如 上海>",
+    "workStartDate": "",
+    "currentSalary": "",
+    "jobStatus": "<在校 / 随时到岗 / 具体到岗时间>",
+    "summary": "<个人优势，3-5 句。技术版往这些点上写：做过什么 AI/大模型应用、用过哪些框架、有没有端到端交付过一个东西、量化结果>",
+    "avatar": "",
+    "socialLinks": {
+      "github": "<GitHub 主页，没有就删掉这行>",
+      "linkedin": "<LinkedIn，没有就删掉这行>"
+    }
+  },
+  "education": [
+    {
+      "school": "<学校中文名>",
+      "schoolEn": "<学校英文名>",
+      "degree": "<学历，如 硕士 / 本科>",
+      "major": "<专业中文名>",
+      "majorEn": "<专业英文名>",
+      "gpa": "<绩点，如 3.6>",
+      "gpaScale": "<满分，如 4.0>",
+      "startDate": "<YYYY-MM>",
+      "endDate": "<YYYY-MM，未毕业写预计毕业年月>",
+      "honors": ["<奖学金/荣誉，没有就留空数组>"]
+    }
+  ],
+  "work": [
+    {
+      "company": "<公司名>",
+      "companyEn": "<公司英文名>",
+      "title": "<职位，如 算法实习生>",
+      "titleEn": "<英文职位>",
+      "department": "<部门>",
+      "startDate": "<YYYY-MM>",
+      "endDate": "<YYYY-MM 或 present>",
+      "description": "<做了什么、用了什么技术、结果如何。一条一行，尽量带数字>",
+      "location": "<城市>"
+    }
+  ],
+  "projects": [
+    {
+      "name": "<项目名>",
+      "role": "<你的角色>",
+      "startDate": "<YYYY-MM>",
+      "endDate": "<YYYY-MM>",
+      "description": "<解决什么问题、你负责哪块、最终效果>",
+      "techStack": ["Python", "<LLM/框架名>", "<数据库>"],
+      "link": "<仓库或演示链接，没有就留空>"
+    }
+  ],
+  "skills": {
+    "languages": ["Python", "<其它编程语言>"],
+    "tools": ["<LLM API / Agent 框架 / 向量库 / 云平台 等>"],
+    "certificates": ["<英语等级、专业证书等>"]
+  },
+  "jobPreference": {
+    "positions": ["AI应用开发工程师", "大模型应用开发", "AI Agent 开发", "算法工程师"],
+    "industries": ["互联网/科技", "通信/电子", "金融"],
+    "salaryRange": "<期望薪资，如 15-25K。写税前固定月薪>",
+    "jobType": "全职",
+    "availableDate": "<可到岗日期 YYYY-MM-DD>"
+  },
+  "custom": [
+    { "key": "紧急联系人", "value": "<姓名>" },
+    { "key": "紧急联系人关系", "value": "<关系，如 父亲>" },
+    { "key": "紧急联系人电话", "value": "<电话>" },
+    { "key": "婚姻状况", "value": "<未婚 / 已婚>" },
+    { "key": "是否需要签证担保", "value": "<否 / 是>" },
+    { "key": "毕业时间", "value": "<YYYY-MM。留学生填学位证日期，不是入学或回国时间>" },
+    { "key": "学历认证状态", "value": "<留学生填：已完成留服认证 / 认证中 / 未开始；非留学生删掉这条>" },
+    { "key": "回国时间", "value": "<留学生填 YYYY-MM；非留学生删掉这条>" }
+  ]
+}

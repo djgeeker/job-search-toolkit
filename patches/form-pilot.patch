@@ -1,0 +1,986 @@
+diff --git a/entrypoints/content.ts b/entrypoints/content.ts
+index a98dc0e..0fb878b 100644
+--- a/entrypoints/content.ts
++++ b/entrypoints/content.ts
+@@ -1,5 +1,7 @@
+ import { findAdapter } from '@/lib/engine/adapters/registry';
+ import { orchestrateFill } from '@/lib/engine/orchestrator';
++// 本地新增：答案库，见 lib/engine/answer-bank.ts
++import { ANSWER_BANK } from '@/lib/engine/answer-bank.data';
+ import type { FillResult, FillResultItem } from '@/lib/engine/adapters/types';
+ import type { Resume, Settings } from '@/lib/storage/types';
+ import { createEmptyResume } from '@/lib/storage/types';
+@@ -140,6 +142,7 @@ export default defineContentScript({
+           domainPrefs,
+           currentDomain,
+           profileDomainPrefs,
++          ANSWER_BANK,
+         );
+         applyFieldHighlights(result);
+         // Fire-and-forget BUMP_FORM_HIT for every Phase 4 fill.
+diff --git a/lib/engine/adapters/types.ts b/lib/engine/adapters/types.ts
+index 9d6fb49..cdcb001 100644
+--- a/lib/engine/adapters/types.ts
++++ b/lib/engine/adapters/types.ts
+@@ -8,7 +8,8 @@ export type InputType =
+   | 'custom-select'
+   | 'contenteditable';
+ 
+-export type FillSource = 'adapter' | 'heuristic' | 'ai' | 'memory' | 'form';
++// 'bank' 是本地新增的答案库层，见 lib/engine/answer-bank.ts
++export type FillSource = 'adapter' | 'heuristic' | 'ai' | 'memory' | 'form' | 'bank';
+ /**
+  * - `filled`        value written, high confidence
+  * - `uncertain`     value written, but matched on a weaker signal
+diff --git a/lib/engine/heuristic/engine.ts b/lib/engine/heuristic/engine.ts
+index 0670193..370d218 100644
+--- a/lib/engine/heuristic/engine.ts
++++ b/lib/engine/heuristic/engine.ts
+@@ -61,8 +61,21 @@ function testSignalAgainstPatterns(
+  * in a text field is visible and correctable; a silently flipped privacy
+  * setting is neither.
+  */
++// 本地改动：原来 `是否` 和 `有无` 是无条件跳过的。
++//
++// 在社招平台上这个判断是对的——那里的「是否」几乎都是隐私开关
++// （是否公开手机号、是否对当前公司保密）。但国内**校招**表单里，「是否」
++// 恰恰是正文问题：基恩士网申上有「是否同时投递校园大使」「工作地点是否服从
++// 公司调配」「是否有销售相关实习经历」「是否为在职员工三代以内血亲」，
++// 上游这条规则会把它们全部跳过，一个都填不了。
++//
++// 改成只有当「是否」和隐私、可见性、订阅这类词一起出现时才跳过。
++//
++// `有无` 保持原样无条件跳过：智联的「学位证书： 有无」是个纯 yes/no 开关，
++// 放开会被 education.degree 的 /学位/ 吃掉填错（有回归测试盯着）。
++// 校招表单问的是「是否…」，不用 `有无`，所以只放宽前者就够。
+ const CONTROL_WORDING_RE =
+-  /显示为|设为|是否|有无|保密|隐藏|屏蔽|不公开|仅对|公开范围|同意|已阅读|接收.*(通知|推送)|订阅|记住我|自动登录|^(本段|该段|此段|本条|该条|本经历|该经历)/;
++  /显示为|设为|是否.*(公开|保密|隐藏|屏蔽|显示|展示|可见|接收|订阅|推送|通知|同意)|有无|保密|隐藏|屏蔽|不公开|仅对|公开范围|同意|已阅读|接收.*(通知|推送)|订阅|记住我|自动登录|^(本段|该段|此段|本条|该条|本经历|该经历)/;
+ 
+ /**
+  * A site-wide search box, not a form field.
+diff --git a/lib/engine/heuristic/fillers.ts b/lib/engine/heuristic/fillers.ts
+index 4ea3be3..b343d1e 100644
+--- a/lib/engine/heuristic/fillers.ts
++++ b/lib/engine/heuristic/fillers.ts
+@@ -142,8 +142,14 @@ async function fillRadio(el: HTMLInputElement, value: string): Promise<boolean>
+         sibling = sibling.nextSibling;
+       }
+       // Parent container's descendant text (ui-radio wrapper pattern)
++      //
++      // 本地改动：只在这个容器**只包着这一个 radio** 时才认。
++      // 容器要是把整组都包了（<fieldset> 就是这样），它的文字里同时有
++      // 题干和所有选项，`includes` 必然命中第一个 radio。
++      // 「工作地点是否服从公司调配 / 是 / 否」填「否」会选中「是」——
++      // 题干里的「是否」两个字就够让它误判了，所有是非题都中招。
+       const wrapper = r.parentElement?.parentElement;
+-      if (wrapper) {
++      if (wrapper && wrapper.querySelectorAll('input[type="radio"]').length === 1) {
+         const clone = wrapper.cloneNode(true) as Element;
+         clone.querySelectorAll('input, select, textarea').forEach((c) => c.remove());
+         const text = clone.textContent?.trim().toLowerCase() ?? '';
+diff --git a/lib/engine/heuristic/patterns.ts b/lib/engine/heuristic/patterns.ts
+index 845a040..6dd1a6f 100644
+--- a/lib/engine/heuristic/patterns.ts
++++ b/lib/engine/heuristic/patterns.ts
+@@ -78,7 +78,11 @@ export const PATTERNS: Record<string, RegExp[]> = {
+ 
+   'basic.location': [
+     /\b(location|city|address|current[\s_-]?city|residence)\b/i,
+-    /现居|所在城市|居住地|城市|地址/,
++    // 本地改动：加 (?!) 守卫。校招表单会同时问「现居城市」和「期望工作城市」，
++    // 裸的 /城市/ 会把期望城市也吃掉，而 basic.location 在表里排得更靠前，
++    // 平分时会赢——结果期望工作城市被填成现居地。
++    // 同样的守卫写法上游已经用在 education.major 和 work.title 上。
++    /现居|所在城市|居住地|(?<!期望工作|意向工作|期望|意向|志愿)城市|地址/,
+     /居住地址/,
+   ],
+ 
+@@ -147,14 +151,22 @@ export const PATTERNS: Record<string, RegExp[]> = {
+ 
+   'education.degree': [
+     /\b(degree|education[\s_-]?level|qualification)\b/i,
+-    /学历|学位|毕业学历/,
++    // 本地改动：留学生要填「学历认证状态」「学位认证进度」，那是留服认证不是学历本身。
++    // education.degree 在表里排得靠前，不加守卫会把认证字段抢走。
++    //
++    // 「最高毕业学历专业类别」同理：它问的是学科门类，选项是工学/理学，
++    // 抢过来只会把「硕士」填进去然后填不上。
++    /学历(?!认证|学位认证|专业|类别|门类)|学位(?!认证)|毕业学历(?!专业)/,
+   ],
+ 
+   'education.major': [
+     /\b(major|field[\s_-]?of[\s_-]?study|discipline|specialization)\b/i,
+     // 专业技能 is a skills picker, not a field of study — and `education.major`
+     // sits earlier in this table, so without the guard it won the tie.
+-    /专业(?!技能|技术能力)|主修|所学专业/,
++    //
++    // 本地补充：「专业类别 / 学科门类」问的是工学、理学这种大类，选项里根本
++    // 没有「计算机科学与技术」，抢过来只会填不上。端到端测试上暴露的。
++    /专业(?!技能|技术能力|类别|门类|大类)|主修|所学专业/,
+   ],
+ 
+   'education.gpa': [
+@@ -280,7 +292,9 @@ export const PATTERNS: Record<string, RegExp[]> = {
+ 
+   'skills.certificates': [
+     /\b(certificate|certification|license|credential)\b/i,
+-    /证书|认证|资格证/,
++    // 本地改动：留学生的「学历认证 / 留服认证 / 学位认证」说的是留服中心那道
++    // 手续，不是技能证书。裸的 /认证/ 会把它抢过来（这条在表里排得更靠前）。
++    /证书|(?<!学历|学位|留服|教育部)认证(?!状态|进度)|资格证/,
+   ],
+ 
+   // ─── Job Preference ─────────────────────────────────────────────────────────
+@@ -303,7 +317,11 @@ export const PATTERNS: Record<string, RegExp[]> = {
+ 
+   'jobPreference.jobType': [
+     /\b(job[\s_-]?type|employment[\s_-]?type|work[\s_-]?type)\b/i,
+-    /工作类型|求职类型|全职|兼职|实习/,
++    // 本地改动：裸的 /实习/ 会吃掉校招表单里的实习经历自述框
++    // （「请简单描述销售相关实习经历」「是否有非销售相关实习经历」），
++    // 结果把"全职"两个字写进 HR 要读的自述里。端到端测试上抓到的。
++    // 只认「实习」真的在说求职类型的写法。
++    /工作类型|求职类型|工作性质|全职|兼职|实习(?!经历|经验|生|期间|工作内容)/,
+   ],
+ 
+   'jobPreference.availableDate': [
+@@ -316,4 +334,100 @@ export const PATTERNS: Record<string, RegExp[]> = {
+     // 行业类别 is 智联's wording, 期望行业 是猎聘的.
+     /意向行业|目标行业|期望行业|行业类别|所属行业/,
+   ],
++
++  // ─── 校招专用（本地新增）────────────────────────────────────────────────
++  //
++  // 上游 FormPilot 的字段表是照着社招平台（智联/BOSS/猎聘/Moka）做的，
++  // 国内校园招聘系统还会问一批社招没有的问题。这些字段没有对应的 Resume
++  // 结构，所以统一走 `custom.<key>` —— 由 orchestrator 的 custom 解析分支
++  // 按 key 到 resume.custom 数组里取值。
++  //
++  // 每条都对应模板 profiles/formpilot-*.template.json 里的一个 custom key。
++
++  'custom.毕业届别': [
++    /\b(graduation[\s_-]?year|grad[\s_-]?year|class[\s_-]?of)\b/i,
++    /毕业届别|届别|所属届别|毕业年份|毕业届/,
++  ],
++
++  'custom.毕业时间': [
++    /\b(graduation[\s_-]?date|expected[\s_-]?graduation)\b/i,
++    // 留学生按学位证日期填，不是入学也不是回国时间。
++    // 「毕业日期」是基恩士的写法，和「毕业时间」不共享子串——
++    // 端到端测试（e2e-campus）上就是这条漏掉的。
++    /预计毕业时间|毕业时间|毕业日期|取得学位时间|取得学位日期|学位证.*时间|学位授予时间|学位授予日期/,
++  ],
++
++  // 学科门类（工学 / 理学 / 管理学）。简历结构里没这个位置，
++  // 而且它和 education.major（具体专业名）是两个不同的问题——基恩士两个都问。
++  'custom.专业类别': [
++    /\b(major[\s_-]?category|field[\s_-]?category|discipline[\s_-]?category)\b/i,
++    /专业类别|学科门类|专业门类|所属学科|专业大类/,
++  ],
++
++  'custom.应届生身份': [
++    /\b(fresh[\s_-]?graduate|new[\s_-]?grad)\b/i,
++    /是否应届|应届生身份|应届情况|是否为应届毕业生/,
++  ],
++
++  'custom.三方协议': [
++    /三方协议|就业协议|是否签订三方|派遣证|报到证/,
++  ],
++
++  'custom.生源地': [
++    /生源地|户籍所在地|户口所在地|籍贯所在地/,
++  ],
++
++  'custom.期望工作城市': [
++    /\b(preferred[\s_-]?location|desired[\s_-]?city|work[\s_-]?location)\b/i,
++    // 注意别和 basic.location（现居地）抢，这里限定"期望/意向/志愿"
++    /期望工作城市|意向工作城市|期望城市|意向城市|志愿工作地|期望工作地点/,
++  ],
++
++  'custom.是否服从调剂': [
++    /是否服从调剂|服从调剂|是否接受调剂|服从分配/,
++  ],
++
++  'custom.紧急联系人': [
++    /\b(emergency[\s_-]?contact(?![\s_-]?(relation|phone|number)))\b/i,
++    /紧急联系人(?!关系|电话|方式)|紧急联络人(?!关系|电话)/,
++  ],
++
++  'custom.紧急联系人关系': [
++    /\b(emergency[\s_-]?contact[\s_-]?relation(ship)?)\b/i,
++    /紧急联系人关系|与紧急联系人关系|联系人关系/,
++  ],
++
++  'custom.紧急联系人电话': [
++    /\b(emergency[\s_-]?contact[\s_-]?(phone|number|tel))\b/i,
++    /紧急联系人电话|紧急联系人手机|紧急联系电话/,
++  ],
++
++  'custom.婚姻状况': [
++    /\b(marital[\s_-]?status)\b/i,
++    /婚姻状况|婚否|是否已婚/,
++  ],
++
++  // ─── 留学生专用（本地新增）──────────────────────────────────────────────
++  //
++  // 规则背景见 docs/overseas-students.md：留学回国人员没有三方协议，
++  // 届别按学位证日期算，学历认证是单独一道门槛。
++
++  'custom.学历认证状态': [
++    /留服认证|学历学位认证|教育部认证|认证状态|学历认证/,
++  ],
++
++  'custom.回国时间': [
++    /\b(return[\s_-]?to[\s_-]?china|repatriation[\s_-]?date)\b/i,
++    /回国时间|归国时间|预计回国/,
++  ],
++
++  'custom.海外院校': [
++    /\b(overseas[\s_-]?(university|school|institution))\b/i,
++    /海外院校|境外院校|留学院校|就读国家|留学国家/,
++  ],
++
++  'custom.是否需要签证担保': [
++    /\b(visa[\s_-]?sponsorship|require[\s_-]?sponsorship|work[\s_-]?authorization)\b/i,
++    /签证担保|是否需要办理签证|工作许可/,
++  ],
+ };
+diff --git a/lib/engine/orchestrator.ts b/lib/engine/orchestrator.ts
+index 2d9f89f..aaee52c 100644
+--- a/lib/engine/orchestrator.ts
++++ b/lib/engine/orchestrator.ts
+@@ -1,4 +1,6 @@
+-import type { PlatformAdapter, FillResult, FillResultItem } from './adapters/types';
++import type { PlatformAdapter, FillResult, FillResultItem, InputType } from './adapters/types';
++import { matchAnswer, type AnswerBankEntry } from './answer-bank';
++import { findLabelText } from '@/lib/capture/signature';
+ import type { Resume } from '@/lib/storage/types';
+ import { scanFields } from './scanner';
+ import { fillElement } from './heuristic/fillers';
+@@ -60,6 +62,22 @@ export function getValueFromResume(
+     return picked?.value ?? '';
+   }
+ 
++  // 本地新增：custom.<key> 按 key 到 resume.custom 数组里取值。
++  //
++  // 上游只把 custom 当成一个存储用的键值列表，没接进填表引擎，所以泛化的
++  // 点路径解析器走到这里会先把数组降成 [0] 再取属性，结果永远是空字符串。
++  // 国内校招问的「毕业届别」「三方协议」「紧急联系人关系」这些字段在
++  // Resume 结构里没有对应位置，只能挂在 custom 上，所以这条分支是必要的。
++  //
++  // key 比较时去掉空白，容忍模板里写成「紧急联系人 关系」这种。
++  if (path.startsWith('custom.')) {
++    const wanted = path.slice('custom.'.length).replace(/\s+/g, '');
++    const hit = (resume.custom ?? []).find(
++      (c) => String(c.key ?? '').replace(/\s+/g, '') === wanted,
++    );
++    return hit?.value ? String(hit.value) : '';
++  }
++
+   // Legacy dotted-path resolver.
+   const indexMatch = path.match(/^(\w+)\[(\d+)\]\.(.+)$/);
+   if (indexMatch) {
+@@ -87,6 +105,26 @@ export function getValueFromResume(
+   return String(cursor);
+ }
+ 
++/**
++ * 本地新增：直接从元素判断控件类型，给答案库用。
++ *
++ * scanned 里的 inputType 是启发式匹配的副产品，字段没被识别时不可靠，
++ * 拿它做答案库的 kinds 限定会全部落空。
++ */
++function elementKind(el: Element): InputType {
++  const tag = el.tagName.toLowerCase();
++  if (tag === 'textarea') return 'textarea';
++  if (tag === 'select') return 'select';
++  if (tag === 'input') {
++    const t = (el.getAttribute('type') ?? 'text').toLowerCase();
++    if (t === 'radio') return 'radio';
++    if (t === 'checkbox') return 'checkbox';
++    if (t === 'date') return 'date';
++  }
++  if ((el as HTMLElement).isContentEditable) return 'contenteditable';
++  return 'text';
++}
++
+ /**
+  * Fill a document's form fields using the cascade strategy:
+  *   Phase 1 (adapter) + Phase 2 (heuristic) — via scanFields
+@@ -101,6 +139,7 @@ export async function orchestrateFill(
+   domainPrefs: FieldDomainPrefs = {},
+   currentDomain: string = '',
+   profileDomainPrefs: Record<string, Record<string, string>> = {},
++  answerBank: AnswerBankEntry[] = [],
+ ): Promise<FillResult> {
+   const scanned = await scanFields(doc, adapter);
+   const items: FillResultItem[] = [];
+@@ -223,6 +262,43 @@ export async function orchestrateFill(
+     }
+   }
+ 
++  // Phase 5 — 答案库（本地新增）。
++  //
++  // 前面几层都要求标签基本一模一样：signature 是标签文本的哈希。校招表单
++  // 同一个问题各家写法不同（「是否有销售相关实习经历?」/「有无销售实习经历」），
++  // 填过一次也复用不上。答案库一条记录挂多个问法，命中任意一个就填。
++  //
++  // 放在最后一层：简历、页面记忆、跨站记忆都没管住的字段才轮到它，
++  // 所以不会抢走前面几层已经填对的东西。
++  if (answerBank.length > 0) {
++    for (const it of items) {
++      if (it.status !== 'unrecognized' && it.status !== 'empty') continue;
++      const el = it.element as HTMLElement;
++      if (el.getAttribute?.('data-formpilot-restored') === 'draft') continue;
++      if (!it.element) continue;
++      // it.label 在启发式没认出字段时会退化成 name/id（比如 "q1"），答案库靠的是
++      // 问题原文，所以这里重新取一次。用 findLabelText 而不是 extractSignals：
++      // radio/checkbox 上后者给的是**选项**文字（"是"/"否"），前者会优先找题干。
++      const label = findLabelText(it.element) || it.label;
++      // 控件类型直接看元素，不用 scanned 里的 inputType —— 字段没被识别时
++      // 那个值不可靠，会让 kinds 限定全部落空。
++      const kind = elementKind(it.element);
++      const hit = matchAnswer(label, answerBank, kind);
++      if (!hit || !hit.answer) continue;
++      try {
++        if (await fillElement(it.element, hit.answer, kind)) {
++          it.status = 'filled';
++          it.source = 'bank';
++          it.resumePath = `(bank:${hit.id})`;
++          it.confidence = 0.7;
++          // 启发式没认出来时 label 是 name/id（"q1"），popup 里看不懂填了什么。
++          // 既然答案库是靠可见标签命中的，就把标签一起修正回去。
++          it.label = label;
++        }
++      } catch { /* 填不上就算了，保持原状态 */ }
++    }
++  }
++
+   const filled = items.filter((i) => i.status === 'filled').length;
+   const uncertain = items.filter((i) => i.status === 'uncertain').length;
+   const empty = items.filter((i) => i.status === 'empty').length;
+diff --git a/lib/engine/answer-bank.data.ts b/lib/engine/answer-bank.data.ts
+new file mode 100644
+index 0000000..8f43067
+--- /dev/null
++++ b/lib/engine/answer-bank.data.ts
+@@ -0,0 +1,206 @@
++/**
++ * 答案库的内容（本地新增）。
++ *
++ * ⚠️ 改完这个文件要重新构建扩展：`yarn build`，然后在 chrome://extensions 点刷新。
++ *
++ * 怎么用
++ * ------
++ * 1. `answer` 留空 = 这条不填（引擎会跳过），只是先把问法记下来
++ * 2. 填上 `answer` 之后，任何一家网申只要问法命中，就会自动填
++ * 3. `phrasings` 随便加，**宁愿冗余也别漏**。加了重复的也没关系
++ * 4. radio / select 的 `answer` 要写**选项上显示的文字**，比如 "是" / "否"
++ * 5. 同一个问题如果不同公司你想答不一样，就拆成两条，各自挂各自的问法
++ *
++ * 怎么快速加新条目
++ * ----------------
++ * 把网申页面另存为 HTML，然后在工具箱根目录跑：
++ *
++ *     python scripts/extract_questions.py 那个页面.html --out 新条目.ts
++ *
++ * 它会把页面上所有问题抽出来，按这里的格式打印，粘过来填答案就行。
++ *
++ * 下面这批是从基恩士 2027 校招网申页抽出来的，**答案我没有替你填** ——
++ * 涉及你自己的经历和意愿，只有你知道。
++ */
++import type { AnswerBankEntry } from './answer-bank';
++
++export const ANSWER_BANK: AnswerBankEntry[] = [
++  // ── 投递意愿类 ────────────────────────────────────────────────────────
++  {
++    id: 'relocate',
++    phrasings: [
++      '工作地点是否服从公司调配',
++      '是否服从工作地点调配',
++      '是否服从调剂',
++      '是否服从分配',
++      '是否接受调剂',
++      '能否接受工作地点调整',
++    ],
++    answer: '',
++    kinds: ['radio', 'select'],
++    note: '服从调配 ≠ 能接受出差。想清楚再填，填了就是所有公司都这么答。',
++  },
++  {
++    id: 'business-travel',
++    phrasings: [
++      '是否接受出差',
++      '能否接受出差',
++      '是否可以接受频繁出差',
++      '对出差的接受程度',
++    ],
++    answer: '是',
++    kinds: ['radio', 'select', 'text'],
++    note: '你说过能接受出差。',
++  },
++  {
++    id: 'campus-ambassador',
++    phrasings: [
++      '是否同时投递校园大使',
++      '是否申请校园大使',
++      '是否愿意担任校园大使',
++    ],
++    answer: '',
++    kinds: ['radio'],
++    note: '基恩士说选「是」有机会拿二面直通卡。',
++  },
++
++  // ── 关系申报类 ────────────────────────────────────────────────────────
++  {
++    id: 'relative-in-company',
++    phrasings: [
++      // 各家会把公司名插进句子中间（「目前**基恩士**在职员工的三代以内」），
++      // 所以整句问法一定要配上短的核心词，否则一换公司就命中不了。
++      '三代以内的血亲',
++      '三代以内血亲',
++      '血亲',
++      '是否为在职员工三代以内的血亲',
++      '是否有亲属在本公司工作',
++      '是否有亲友在我司任职',
++      '请确认你是否为目前在职员工的三代以内的血亲',
++      '亲属关系申报',
++    ],
++    answer: '',
++    kinds: ['radio'],
++    note: '据实填。填错属于虚假信息，后果比填「否」严重得多。',
++  },
++
++  // ── 经历自述类（都是 0/50 字这种短填空）────────────────────────────────
++  {
++    id: 'has-sales-intern',
++    phrasings: [
++      '是否有销售相关实习经历',
++      '有无销售实习经历',
++      '是否具备销售实习经验',
++      '是否有销售相关经历',
++      '是否有销售经验',
++      '有无销售或客户相关经历',
++      '是否有市场或销售相关实践经历',
++    ],
++    answer: '是',
++    kinds: ['radio'],
++    note: '英国自主创业项目：小红书投流获客 + 散客沟通成交 + Airbnb 对接。不是"实习"而是创业，描述里要写明，别让 HR 以为你在公司实习过。',
++  },
++  {
++    id: 'sales-intern-desc',
++    phrasings: [
++      '请简单描述销售相关实习经历',
++      '销售相关实习经历描述',
++      '请描述你的销售实习经历',
++    ],
++    answer: '英国定制旅行项目：小红书获客，负责需求分析、方案设计、报价与成交，并对接Airbnb等资源交付。',
++    kinds: ['textarea', 'text'],
++    note: '48 字，和 cv_技术销售.pdf 的说法一致。基恩士限 50 字。',
++  },
++  {
++    id: 'has-nonsales-intern',
++    phrasings: [
++      '是否有非销售相关实习经历',
++      '有无其他实习经历',
++      '是否有其他方向的实习经历',
++    ],
++    answer: '是',
++    kinds: ['radio'],
++    note: 'Medic Recall 软件开发实习（NHS 项目）。',
++  },
++  {
++    id: 'nonsales-intern-desc',
++    phrasings: [
++      '请简单描述非销售相关实习经历',
++      '非销售相关实习经历描述',
++      '其他实习经历描述',
++    ],
++    answer: '在 Medic Recall 做软件开发实习，用 Flutter 重构工程并实现答题与邮件通知功能。',
++    kinds: ['textarea', 'text'],
++    note: '43 字，基恩士限 50 字。别的站限更少就再删。',
++  },
++  {
++    id: 'has-campus-project',
++    phrasings: [
++      '是否有校园实践经历或项目经历',
++      '是否有项目经历',
++      '有无校园实践经历',
++      '是否参加过校园活动或项目',
++    ],
++    answer: '是',
++    kinds: ['radio'],
++    note: 'LifePilot、Unity VR、机器学习课程项目等。',
++  },
++  {
++    id: 'campus-project-desc',
++    phrasings: [
++      '请简单描述校园实践经历或项目经历',
++      '校园实践经历或项目经历描述',
++      '请描述你的项目经历',
++    ],
++    answer: '独立开发 LifePilot 多智能体平台，用 LangGraph 和 MCP 做任务编排与工具调用。',
++    kinds: ['textarea', 'text'],
++    note: '40 字。想突出跨境电商就换成 Shopify 独立站那个。',
++  },
++
++  // ── 招聘渠道类 ────────────────────────────────────────────────────────
++  {
++    id: 'info-channel',
++    phrasings: [
++      '初次了解招聘信息的渠道',
++      '你是通过什么渠道了解到我们的',
++      '平时收集招聘信息渠道',
++      '获知本次招聘信息的途径',
++      '信息来源渠道',
++    ],
++    answer: '',
++    kinds: ['radio', 'select', 'checkbox'],
++    note: '常见选项：小红书 / 抖音 / BOSS / 猎聘 / 牛客 / 前程无忧 / 实习僧 / 海投 / 其它。',
++  },
++  {
++    id: 'info-channel-other',
++    phrasings: [
++      '其他来源渠道',
++      '若选其它请填写',
++      '其它渠道请注明',
++    ],
++    answer: '',
++    kinds: ['text', 'textarea'],
++  },
++
++  // ── 校招通用 ─────────────────────────────────────────────────────────
++  {
++    id: 'interview-city',
++    phrasings: [
++      '校招面试站点',
++      '期望面试城市',
++      '面试城市',
++      '请选择您大学所在城市',
++      '海外同学选择方便面试的城市',
++    ],
++    answer: '上海',
++    kinds: ['select', 'radio', 'text'],
++    note: '你说上海优先。海外院校一般让你选个方便面试的城市。',
++  },
++  {
++    id: 'referral-code',
++    phrasings: ['推荐码', '内推码', '推荐人编号', '内推编号'],
++    answer: '',
++    kinds: ['text'],
++    note: '有内推码的时候临时填，别长期挂着——不同公司码不一样。',
++  },
++];
+diff --git a/lib/engine/answer-bank.ts b/lib/engine/answer-bank.ts
+new file mode 100644
+index 0000000..7fa7e9b
+--- /dev/null
++++ b/lib/engine/answer-bank.ts
+@@ -0,0 +1,76 @@
++/**
++ * 答案库（本地新增）
++ *
++ * 上游已经有两层记忆：page-memory（按 URL）和 form-store（按字段 signature 跨站）。
++ * 两层都要求**标签基本一模一样**才能命中——signature 是标签文本的哈希。
++ * 校招表单同一个问题各家写法都不同：
++ *
++ *   「是否有销售相关实习经历?」
++ *   「请问您是否有销售相关的实习经历」
++ *   「有无销售实习经历」
++ *
++ * 这三条哈希完全不同，填过一次也不会复用。答案库解决这个：一条记录挂多个
++ * 问法，只要命中任意一个就填。
++ *
++ * 设计取舍（按 我 的要求）：**宁愿冗余也要能命中。**
++ * 问法列表随便加，重复了也无所谓；「是」和「否」的答案分开写成两条更好维护。
++ */
++
++export interface AnswerBankEntry {
++  /** 稳定 id，方便在表格和文档里引用 */
++  id: string;
++  /** 这个问题的各种问法。命中任意一个即可，随便加，冗余没关系 */
++  phrasings: string[];
++  /** 要填进去的内容。radio/select 填**选项上显示的文字**，比如 "是" / "否" */
++  answer: string;
++  /** 只在这些控件类型上生效；省略表示不限 */
++  kinds?: Array<'text' | 'textarea' | 'select' | 'radio' | 'checkbox'>;
++  /** 给人看的说明，引擎不用 */
++  note?: string;
++}
++
++/** 去掉空白和标点，让「是否有销售相关实习经历?」和「是否有销售相关实习经历」等价 */
++export function normalizeLabel(s: string): string {
++  return (s ?? '')
++    .replace(/\s+/g, '')
++    .replace(/[?？:：。.,，、!！（）()【】\[\]"'“”‘’*※・\-—_/]/g, '')
++    .toLowerCase();
++}
++
++/**
++ * 在答案库里找匹配的条目。
++ *
++ * 两轮：先要求问法完整包含在标签里（或反过来），命中最长的那个；
++ * 没有再退化到「标签里出现了问法的全部关键片段」。
++ * 不做编辑距离——校招标签普遍很长，模糊匹配容易乱配，宁可漏也别填错。
++ */
++export function matchAnswer(
++  label: string,
++  bank: AnswerBankEntry[],
++  kind?: string,
++): AnswerBankEntry | null {
++  const norm = normalizeLabel(label);
++  if (!norm) return null;
++
++  let best: AnswerBankEntry | null = null;
++  let bestLen = 0;
++
++  for (const entry of bank) {
++    if (entry.kinds && kind && !entry.kinds.includes(kind as never)) continue;
++    for (const p of entry.phrasings) {
++      const np = normalizeLabel(p);
++      if (!np) continue;
++      // 问法出现在标签里，或标签整个就是问法的一部分。
++      // 反向那半边要求标签本身够长（>=6）：不然 radio 的选项文字「是」
++      // 会命中任何含「是」的问法，等于乱配。
++      const hit = norm.includes(np) || (norm.length >= 6 && np.length > 6 && np.includes(norm));
++      if (!hit) continue;
++      // 命中最长的问法——最长的通常最具体，最不容易配错
++      if (np.length > bestLen) {
++        bestLen = np.length;
++        best = entry;
++      }
++    }
++  }
++  return best;
++}
+diff --git a/tests/lib/engine/answer-bank.test.ts b/tests/lib/engine/answer-bank.test.ts
+new file mode 100644
+index 0000000..66aec4c
+--- /dev/null
++++ b/tests/lib/engine/answer-bank.test.ts
+@@ -0,0 +1,115 @@
++/**
++ * 答案库（本地新增）。重点验两件事：
++ *  1. 换个问法也能命中——这是它存在的理由
++ *  2. 它只在前面几层都没管住时才出手，不会抢走简历已经填对的字段
++ */
++import { describe, it, expect, beforeEach } from 'vitest';
++import { matchAnswer, normalizeLabel, type AnswerBankEntry } from '@/lib/engine/answer-bank';
++import { orchestrateFill } from '@/lib/engine/orchestrator';
++import { createEmptyResume } from '@/lib/storage/types';
++
++const bank: AnswerBankEntry[] = [
++  {
++    id: 'has-sales-intern',
++    phrasings: ['是否有销售相关实习经历', '有无销售实习经历', '是否具备销售实习经验'],
++    answer: '是',
++    kinds: ['radio', 'text'],
++  },
++  {
++    id: 'interview-city',
++    phrasings: ['校招面试站点', '期望面试城市', '面试城市'],
++    answer: '上海',
++    kinds: ['text', 'select'],
++  },
++  {
++    id: 'blank-on-purpose',
++    phrasings: ['是否服从工作地点调配'],
++    answer: '',
++    kinds: ['radio'],
++  },
++];
++
++describe('normalizeLabel', () => {
++  it('抹掉空白和标点', () => {
++    expect(normalizeLabel('是否有销售相关实习经历？')).toBe('是否有销售相关实习经历');
++    expect(normalizeLabel(' 校招面试站点 : ')).toBe('校招面试站点');
++  });
++});
++
++describe('matchAnswer', () => {
++  it('原样的问法命中', () => {
++    expect(matchAnswer('是否有销售相关实习经历', bank)?.id).toBe('has-sales-intern');
++  });
++
++  it('换个说法也命中 —— 这是答案库的意义', () => {
++    expect(matchAnswer('有无销售实习经历？', bank)?.id).toBe('has-sales-intern');
++    expect(matchAnswer('请问您是否具备销售实习经验', bank)?.id).toBe('has-sales-intern');
++  });
++
++  it('标签里带前后缀也能命中', () => {
++    expect(matchAnswer('* 校招面试站点（请选择您大学所在城市）', bank)?.id).toBe('interview-city');
++  });
++
++  it('不相干的标签不命中', () => {
++    expect(matchAnswer('紧急联系人电话', bank)).toBeNull();
++    expect(matchAnswer('', bank)).toBeNull();
++  });
++
++  it('kinds 限定生效', () => {
++    expect(matchAnswer('是否有销售相关实习经历', bank, 'textarea')).toBeNull();
++    expect(matchAnswer('是否有销售相关实习经历', bank, 'radio')?.id).toBe('has-sales-intern');
++  });
++
++  it('多条命中时取问法最长的那个（最具体）', () => {
++    const b: AnswerBankEntry[] = [
++      { id: 'short', phrasings: ['经历'], answer: 'A' },
++      { id: 'long', phrasings: ['是否有销售相关实习经历'], answer: 'B' },
++    ];
++    expect(matchAnswer('是否有销售相关实习经历', b)?.id).toBe('long');
++  });
++});
++
++describe('答案库在填表流程里的位置', () => {
++  beforeEach(() => { document.body.innerHTML = ''; });
++
++  function field(label: string, id: string, tag = 'input') {
++    const d = document.createElement('div');
++    d.innerHTML = `<label for="${id}">${label}</label>` +
++      (tag === 'textarea' ? `<textarea id="${id}" name="${id}"></textarea>`
++                          : `<input id="${id}" name="${id}" type="text">`);
++    document.body.appendChild(d);
++  }
++
++  it('简历管不了的字段，由答案库补上', async () => {
++    field('有无销售实习经历', 'q1');
++    const r = await orchestrateFill(document, createEmptyResume('a', 'a'), null, [], {}, {}, '', {}, bank);
++    expect((document.getElementById('q1') as HTMLInputElement).value).toBe('是');
++    expect(r.items.find((i) => i.label.includes('销售'))?.source).toBe('bank');
++  });
++
++  it('简历已经填对的字段，答案库不抢', async () => {
++    field('姓名', 'name');
++    field('面试城市', 'city');
++    const resume = createEmptyResume('a', 'a');
++    resume.basic.name = '董家豪';
++    const withName: AnswerBankEntry[] = [
++      ...bank,
++      { id: 'hijack', phrasings: ['姓名'], answer: '不该出现的值' },
++    ];
++    await orchestrateFill(document, resume, null, [], {}, {}, '', {}, withName);
++    expect((document.getElementById('name') as HTMLInputElement).value).toBe('董家豪');
++    expect((document.getElementById('city') as HTMLInputElement).value).toBe('上海');
++  });
++
++  it('answer 为空的条目不填，字段保持原样', async () => {
++    field('是否服从工作地点调配', 'q2');
++    await orchestrateFill(document, createEmptyResume('a', 'a'), null, [], {}, {}, '', {}, bank);
++    expect((document.getElementById('q2') as HTMLInputElement).value).toBe('');
++  });
++
++  it('不传答案库时行为不变', async () => {
++    field('有无销售实习经历', 'q3');
++    await orchestrateFill(document, createEmptyResume('a', 'a'), null);
++    expect((document.getElementById('q3') as HTMLInputElement).value).toBe('');
++  });
++});
+diff --git a/tests/fixtures/campus-keyence.html b/tests/fixtures/campus-keyence.html
+new file mode 100644
+index 0000000..a7d3943
+--- /dev/null
++++ b/tests/fixtures/campus-keyence.html
+@@ -0,0 +1,203 @@
++<!--
++  按基恩士 2027 校招网申页复刻的表单结构（截图 2026-09-06）。
++  只保留字段结构，不含任何真实个人信息。
++  用途：端到端验证「字段解析 → 填写」这条链路，见 tests/lib/engine/e2e-campus.test.ts
++-->
++<div class="apply-form">
++
++  <h2>投递意向</h2>
++  <div class="form-item">
++    <label for="referral">推荐码</label>
++    <input id="referral" name="referral" type="text" placeholder="请输入">
++  </div>
++
++  <h2>个人信息</h2>
++
++  <div class="form-item">
++    <label for="site">*校招面试站点（请选择您大学所在城市/距您大学最近的城市，海外同学选择方便面试的城市）</label>
++    <select id="site" name="site">
++      <option value="">请选择</option>
++      <option>上海</option><option>北京</option><option>广州</option><option>深圳</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="name">*姓名</label>
++    <input id="name" name="name" type="text">
++  </div>
++
++  <fieldset class="form-item">
++    <legend>*性别</legend>
++    <label><input type="radio" name="gender" value="male"> 男</label>
++    <label><input type="radio" name="gender" value="female"> 女</label>
++  </fieldset>
++
++  <div class="form-item">
++    <label for="phone">*手机号码</label>
++    <select id="phoneRegion" name="phoneRegion"><option>中国大陆</option></select>
++    <input id="phone" name="phone" type="text">
++  </div>
++
++  <div class="form-item">
++    <label for="email">*邮箱</label>
++    <input id="email" name="email" type="text" placeholder="请输入">
++  </div>
++
++  <div class="form-item">
++    <label for="idno">*证件号码</label>
++    <select id="idtype" name="idtype"><option>身份证</option></select>
++    <input id="idno" name="idno" type="text" placeholder="请输入">
++  </div>
++
++  <div class="form-item">
++    <label for="birthday">*出生日期</label>
++    <input id="birthday" name="birthday" type="text" placeholder="请选择">
++  </div>
++
++  <div class="form-item">
++    <label for="channel">*初次了解基恩士招聘信息的渠道</label>
++    <select id="channel" name="channel">
++      <option value="">请选择</option>
++      <option>学校就业网</option><option>宣讲会</option><option>招聘网站</option><option>其它</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="channelOther">*其他来源渠道</label>
++    <textarea id="channelOther" name="channelOther" placeholder="请输入"></textarea>
++  </div>
++
++  <div class="form-item">
++    <label for="degree">*最高毕业学历</label>
++    <select id="degree" name="degree">
++      <option value="">请选择</option>
++      <option>本科</option><option>硕士</option><option>博士</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="major">*最高毕业学历专业</label>
++    <input id="major" name="major" type="text" placeholder="请输入">
++  </div>
++
++  <div class="form-item">
++    <label for="majorCat">*最高毕业学历专业类别</label>
++    <select id="majorCat" name="majorCat">
++      <option value="">请选择</option>
++      <option>工学</option><option>理学</option><option>管理学</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="gradYear">*毕业年份</label>
++    <select id="gradYear" name="gradYear">
++      <option value="">请选择</option>
++      <option>2026</option><option>2027</option><option>2028</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="gradDate">*毕业日期</label>
++    <input id="gradDate" name="gradDate" type="text" placeholder="请选择">
++  </div>
++
++  <fieldset class="form-item">
++    <legend>*是否同时投递校园大使?（有机会获得二面直通卡）</legend>
++    <label><input type="radio" name="ambassador" value="y"> 是</label>
++    <label><input type="radio" name="ambassador" value="n"> 否</label>
++  </fieldset>
++
++  <fieldset class="form-item">
++    <legend>*工作地点是否服从公司调配</legend>
++    <label><input type="radio" name="relocate" value="y"> 是</label>
++    <label><input type="radio" name="relocate" value="n"> 否</label>
++  </fieldset>
++
++  <fieldset class="form-item">
++    <legend>*请确认你是否为目前基恩士在职员工的三代以内的血亲（子女，兄弟姐妹，甥，侄）</legend>
++    <label><input type="radio" name="relative" value="y"> 是</label>
++    <label><input type="radio" name="relative" value="n"> 否</label>
++  </fieldset>
++
++  <fieldset class="form-item">
++    <legend>*是否有销售相关实习经历?</legend>
++    <label><input type="radio" name="salesIntern" value="y"> 是</label>
++    <label><input type="radio" name="salesIntern" value="n"> 否</label>
++  </fieldset>
++
++  <div class="form-item">
++    <label for="salesInternDesc">请简单描述销售相关实习经历</label>
++    <textarea id="salesInternDesc" name="salesInternDesc" maxlength="50" placeholder="请输入"></textarea>
++  </div>
++
++  <fieldset class="form-item">
++    <legend>*是否有非销售相关实习经历?</legend>
++    <label><input type="radio" name="otherIntern" value="y"> 是</label>
++    <label><input type="radio" name="otherIntern" value="n"> 否</label>
++  </fieldset>
++
++  <div class="form-item">
++    <label for="otherInternDesc">请简单描述非销售相关实习经历</label>
++    <textarea id="otherInternDesc" name="otherInternDesc" maxlength="50" placeholder="请输入"></textarea>
++  </div>
++
++  <fieldset class="form-item">
++    <legend>*是否有校园实践经历或项目经历?</legend>
++    <label><input type="radio" name="campusProject" value="y"> 是</label>
++    <label><input type="radio" name="campusProject" value="n"> 否</label>
++  </fieldset>
++
++  <div class="form-item">
++    <label for="campusProjectDesc">请简单描述校园实践经历或项目经历</label>
++    <textarea id="campusProjectDesc" name="campusProjectDesc" maxlength="50" placeholder="请输入"></textarea>
++  </div>
++
++  <fieldset class="form-item">
++    <legend>*平时收集招聘信息渠道</legend>
++    <label><input type="radio" name="infoChannel" value="1"> 小红书</label>
++    <label><input type="radio" name="infoChannel" value="2"> 抖音</label>
++    <label><input type="radio" name="infoChannel" value="3"> BOSS</label>
++    <label><input type="radio" name="infoChannel" value="4"> 猎聘</label>
++    <label><input type="radio" name="infoChannel" value="5"> 牛客</label>
++    <label><input type="radio" name="infoChannel" value="6"> 前程无忧</label>
++    <label><input type="radio" name="infoChannel" value="7"> 实习僧</label>
++    <label><input type="radio" name="infoChannel" value="8"> 海投</label>
++    <label><input type="radio" name="infoChannel" value="9"> 其它</label>
++  </fieldset>
++
++  <div class="form-item">
++    <label for="infoChannelOther">若选"其它"，请填写</label>
++    <input id="infoChannelOther" name="infoChannelOther" type="text" placeholder="请输入">
++  </div>
++
++  <h2>教育经历</h2>
++
++  <div class="form-item">
++    <label for="school">*学校名称</label>
++    <input id="school" name="school" type="text" placeholder="请输入">
++  </div>
++
++  <div class="form-item">
++    <label for="eduDegree">*学历</label>
++    <select id="eduDegree" name="eduDegree">
++      <option value="">请选择</option>
++      <option>本科</option><option>硕士</option><option>博士</option>
++    </select>
++  </div>
++
++  <div class="form-item">
++    <label for="eduStart">*开始时间</label>
++    <input id="eduStart" name="eduStart" type="text" placeholder="请选择">
++  </div>
++
++  <div class="form-item">
++    <label for="eduEnd">*结束时间</label>
++    <input id="eduEnd" name="eduEnd" type="text" placeholder="请选择">
++  </div>
++
++  <div class="form-item">
++    <label for="eduMajor">*专业名称</label>
++    <input id="eduMajor" name="eduMajor" type="text" placeholder="请输入">
++  </div>
++
++</div>
